@@ -12,7 +12,7 @@ on:
         description: "File name"
         default: "ClipByNaim"
       part_min:
-        description: "Minutes per file (20 is safe, GitHub allows 4 GB per file)"
+        description: "Minutes per file (20 is safe, GitHub allows 2 GB per file)"
         default: "60"
 
 permissions:
