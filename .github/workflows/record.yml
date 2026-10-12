@@ -1,0 +1,44 @@
+name: Record
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "m3u8 link"
+        required: true
+      minutes:
+        description: "Stop after N minutes (0 = until you send /stop)"
+        default: "120"
+      name:
+        description: "File name"
+        default: "ClipByNaim"
+      part_min:
+        description: "Minutes per file (20 is safe, GitHub allows 2 GB per file)"
+        default: "20"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      URL: ${{ inputs.url }}
+      MINUTES: ${{ inputs.minutes }}
+      NAME: ${{ inputs.name }}
+      PART_MIN: ${{ inputs.part_min }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Record
+        run: python3 gh_record.py
+      - name: Upload leftovers if cancelled
+        if: always()
+        run: python3 gh_record.py finish
