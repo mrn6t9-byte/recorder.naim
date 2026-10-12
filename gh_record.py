@@ -18,6 +18,15 @@ DRY = E("DRY") == "1"                         # test mode: no uploads
 TAG = "rec-" + RUN
 LIMIT = 345 * 60                              # one job can run ~6h; chain a new run before that
 STAMP = time.strftime("%Y%m%d_%H%M%S")
+UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+REFERER = E("REFERER") or ""
+API_ID, API_HASH = E("TG_API_ID", ""), E("TG_API_HASH", "")   # optional: lets the bot upload files up to 2 GB
+BIG_LIMIT = 1950 * 1000 * 1000
+HDR = ["-user_agent", UA] + (["-referer", REFERER] if REFERER else [])
+
+
+def mask(t):
+    return (t or "").replace(URL, "<link>")
 REL_URL = "https://github.com/%s/releases/tag/%s" % (REPO, TAG)
 
 stop = threading.Event()
@@ -41,10 +50,28 @@ def tg(method, **data):
         req = urllib.request.Request("https://api.telegram.org/bot%s/%s" % (TOKEN, method), urllib.parse.urlencode(data).encode())
         return json.load(urllib.request.urlopen(req, timeout=40))
     except urllib.error.HTTPError as e:
+        try: body = e.read().decode()[:200]
+        except Exception: body = ""
+        print("Telegram error %s: %s" % (e.code, body), flush=True)
         return {"ok": False, "error_code": e.code}
     except Exception as e:
         print("telegram error:", e)
         return {}
+
+
+def detect_chat():
+    """If TG_CHAT is empty, use the chat of the latest message sent to the bot (send it 'hi' first)."""
+    global CHAT
+    if CHAT or not TOKEN or DRY:
+        return
+    r = tg("getUpdates", timeout=0)
+    ids = [(u.get("message") or {}).get("chat", {}).get("id") for u in r.get("result", [])]
+    ids = [i for i in ids if i]
+    if ids:
+        CHAT = str(ids[-1])
+        print("Chat detected from the latest message sent to the bot.", flush=True)
+    else:
+        print("NO CHAT ID: send 'hi' to your bot in Telegram, then run again (within 24 hours).", flush=True)
 
 
 def say(text):
@@ -105,6 +132,53 @@ def ensure_release():
                     "--notes", "%s\n%s" % (NAME, URL.split("?")[0])], capture_output=True)
 
 
+def media_info(path):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration",
+                            "-of", "json", path], capture_output=True, text=True, timeout=60)
+        j = json.loads(r.stdout or "{}"); st = (j.get("streams") or [{}])[0]
+        return int(float((j.get("format") or {}).get("duration") or 0)), int(st.get("width") or 0), int(st.get("height") or 0)
+    except Exception:
+        return 0, 0, 0
+
+
+def tg_big(path, caption):
+    """Upload up to ~2 GB to your chat as the bot (MTProto). Returns None = not configured, True = sent, False = failed."""
+    if not (API_ID and API_HASH and TOKEN and CHAT) or DRY:
+        return None
+    if os.path.getsize(path) > BIG_LIMIT:
+        print("File is larger than 1.95 GB, not sending to Telegram. Use a smaller 'Minutes per file'.", flush=True)
+        return False
+    try:
+        import asyncio
+        from pyrogram import Client
+    except Exception as e:
+        print("Telegram uploader missing:", e, flush=True)
+        return False
+    dur, w, h = media_info(path)
+    thumb = path + ".jpg"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", path, "-frames:v", "1", "-vf", "scale=320:-2", thumb], capture_output=True)
+
+    async def go():
+        async with Client("rec", api_id=int(API_ID), api_hash=API_HASH, bot_token=TOKEN, in_memory=True, no_updates=True) as app:
+            if path.endswith(".mp4") and w:
+                kw = dict(caption=caption, supports_streaming=True, duration=dur, width=w, height=h)
+                if os.path.exists(thumb):
+                    kw["thumb"] = thumb
+                await app.send_video(int(CHAT), path, **kw)
+            else:
+                await app.send_document(int(CHAT), path, caption=caption)
+    ok = True
+    try:
+        asyncio.run(go())
+    except Exception as e:
+        print("Telegram upload failed:", repr(e), flush=True)
+        ok = False
+    try: os.remove(thumb)
+    except OSError: pass
+    return ok
+
+
 def process(ts):
     """remux finished .ts part to .mp4 (proper duration), upload it, delete local files."""
     mp4 = ts[:-3] + ".mp4"
@@ -120,8 +194,14 @@ def process(ts):
         ok = subprocess.run(["gh", "release", "upload", TAG, mp4, "--repo", REPO, "--clobber"]).returncode == 0
     if ok:
         state["uploaded"] += 1; state["bytes"] += size
-        say("Part ready: %s (%s)\n%s" % (os.path.basename(mp4), human(size), REL_URL))
-        if size <= 49 * 1024 * 1024 and TOKEN and CHAT and not DRY:
+        big = tg_big(mp4, os.path.basename(mp4))
+        if big:
+            say("Video sent: %s (%s)\nBackup copy: %s" % (os.path.basename(mp4), human(size), REL_URL))
+        elif big is False:
+            say("Part ready: %s (%s)\nCould not send it to Telegram (see the run log). Download it here:\n%s" % (os.path.basename(mp4), human(size), REL_URL))
+        else:
+            say("Part ready: %s (%s)\n%s" % (os.path.basename(mp4), human(size), REL_URL))
+        if big is None and size <= 49 * 1024 * 1024 and TOKEN and CHAT and not DRY:
             subprocess.run(["curl", "-s", "-F", "chat_id=" + CHAT, "-F", "document=@" + mp4,
                             "https://api.telegram.org/bot%s/sendDocument" % TOKEN], capture_output=True)
         if not DRY:
@@ -148,9 +228,9 @@ def uploader():
 
 def precheck():
     try:
-        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-t", "6", "-i", URL, "-f", "null", "-"],
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + HDR + ["-t", "6", "-i", URL, "-f", "null", "-"],
                            capture_output=True, text=True, timeout=90)
-        return r.returncode == 0, (r.stderr or "").strip()[-300:]
+        return r.returncode == 0, mask((r.stderr or "").strip())[-400:]
     except Exception as e:
         return False, str(e)
 
@@ -174,9 +254,11 @@ def chain(rem_minutes):
 
 def record():
     os.makedirs(OUT, exist_ok=True)
+    detect_chat()
     ok, err = precheck()
     if not ok:
-        say("The link could not be opened from GitHub's server.\nLikely geo/IP blocked or the token expired.\n" + err)
+        print("PRECHECK FAILED. ffmpeg said:\n" + err, flush=True)
+        say("The link could not be opened from GitHub's server.\nLikely geo/IP blocked or the token expired.\nffmpeg said: " + err)
         sys.exit(1)
     say("Recording started on GitHub (%s)\nRunner location: %s\nFiles will appear here: %s\nSend /status or /stop." % (NAME, where(), REL_URL))
     signal.signal(signal.SIGINT, lambda *a: halt())
@@ -196,7 +278,7 @@ def record():
         if used >= end - 3:
             break
         idx = len(parts()) + len(glob.glob(os.path.join(OUT, "%s_%s_part*.mp4" % (NAME, STAMP)))) + state["uploaded"]
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-rw_timeout", "30000000", "-live_start_index", "-" + BACK,
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-rw_timeout", "30000000", "-live_start_index", "-" + BACK] + HDR + [
                "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-t", str(int(end - used)),
                "-f", "segment", "-segment_time", str(int(PART_MIN * 60)), "-segment_format", "mpegts",
                "-segment_start_number", str(idx + 1), "-reset_timestamps", "1",
@@ -207,7 +289,7 @@ def record():
             break
         state["restarts"] += 1
         if state["restarts"] == 1 or state["restarts"] % 5 == 0:
-            say("Stream dropped or ended, retrying (%d)...\n%s" % (state["restarts"], last_err.strip()[-200:]))
+            say("Stream dropped or ended, retrying (%d)...\n%s" % (state["restarts"], mask(last_err).strip()[-200:]))
         time.sleep(5)
     state["finished"] = True
     up.join()
