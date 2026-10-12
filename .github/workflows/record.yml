@@ -7,13 +7,13 @@ on:
         required: true
       minutes:
         description: "Stop after N minutes (0 = until you send /stop)"
-        default: "120"
+        default: "480"
       name:
         description: "File name"
         default: "ClipByNaim"
       part_min:
         description: "Minutes per file (20 is safe, GitHub allows 2 GB per file)"
-        default: "20"
+        default: "30"
 
 permissions:
   contents: write     # upload recordings to a Release
