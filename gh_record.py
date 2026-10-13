@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
 """Runs inside GitHub Actions.
-Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files
-(every PART_MIN minutes, at most PART_MAX_MB, or when you press Split) at keyframes, uploads each finished
-file to a GitHub Release (and to Telegram if TG_API_ID/TG_API_HASH are set) while the recording keeps going.
+Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
+keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
+file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
   python gh_record.py            record
   python gh_record.py finish     upload anything left over (used by the always() step)"""
 import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
 
 E = os.environ.get
 TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
-REPO, RUN, SHA = E("REPO", ""), E("RUN_ID", "local"), E("SHA", "")
+REPO, RUN = E("REPO", ""), E("RUN_ID", "local")
 URL = E("URL", "")
 NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")
 MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
-PART_MIN = float(E("PART_MIN") or 60)           # a new file every N minutes of video
-PART_MAX = float(E("PART_MAX_MB") or 1900) * 1e6  # ...or when a file reaches this size (GitHub allows 2 GB per file)
+PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
+PART_MAX = min(float(E("PART_MB") or 4000), 5000) * 1e6   # a new file every N MB (4000 = 4 GB)
 BACK = E("BACK_SEGS") or "5"                    # start N segments behind live (safety)
 OUT = E("OUT_DIR") or "rec"
+MP4_DIR = E("MP4_DIR") or OUT                    # finished .mp4 files (a different disk folder from the .ts files)
 FAILED = E("FAILED_DIR") or "rec_failed"
 DRY = E("DRY") == "1"                           # test mode: no uploads
 TEST_ONCE = E("TEST_ONCE") == "1"               # test mode: do not restart when the input ends
-TAG = "rec-" + RUN
+GOFILE_URL = E("GOFILE_URL") or "https://upload.gofile.io/uploadfile"
+RETRY_BASE = float(E("RETRY_BASE") or 30)       # seconds, grows with every upload retry
+GF = {"folder": "", "token": ""}
 LIMIT = 345 * 60                                # one job runs ~6 h; a new run continues before that
 STAMP = time.strftime("%Y%m%d_%H%M%S")
-REL_URL = "https://github.com/%s/releases/tag/%s" % (REPO, TAG)
 RUN_URL = "https://github.com/%s/actions/runs/%s" % (REPO, RUN)
 UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 REFERER = E("REFERER") or ""
-API_ID, API_HASH = E("TG_API_ID", ""), E("TG_API_HASH", "")   # optional: lets the bot upload files up to 2 GB
-BIG_LIMIT = 1950 * 1000 * 1000
 HDR = ["-user_agent", UA]
 
 stop = threading.Event()
-S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "rel_err": "", "split_msgs": 0}
+S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": ""}
 upq = queue.Queue()
 SP = None
 
@@ -207,7 +207,7 @@ class Splitter:
         if self.want_split:
             self.want_split = False; self.manual_flag = True
             return True
-        return self.media_secs() >= PART_MIN * 60 or self.cur_bytes >= PART_MAX
+        return (PART_MIN > 0 and self.media_secs() >= PART_MIN * 60) or self.cur_bytes >= PART_MAX
 
     def feed(self, data):
         self.buf += data
@@ -261,10 +261,11 @@ def status_text():
     spd = sp.speed_mbps() if sp else 0
     nxt = ""
     if sp and sp.f:
-        t_left = PART_MIN * 60 - sp.media_secs()
+        t_left = (PART_MIN * 60 - sp.media_secs()) if PART_MIN > 0 else 1e12
         if spd > 0.1:
             t_left = min(t_left, (PART_MAX - sp.cur_bytes) * 8 / (spd * 1e6))
-        nxt = "\n✂️ <b>Next auto-split</b>  in ~%s" % mmss(t_left)
+        if t_left < 1e11:
+            nxt = "\n✂️ <b>Next auto-split</b>  in ~%s  (at %s)" % (mmss(t_left), human(PART_MAX))
     lines = [
         "🔴 <b>Recording</b>  ·  %s" % esc(NAME), "",
         "⏱ <b>Elapsed</b>  %s%s" % (hms(el), ("   ·   left %s" % hms(left)) if left is not None else ""),
@@ -274,7 +275,8 @@ def status_text():
     ]
     if S["restarts"]:
         lines.append("♻️ <b>Reconnects</b>  %d" % S["restarts"])
-    lines += ["", '🔗 <a href="%s">Open files</a>' % REL_URL]
+    if S["page"]:
+        lines += ["", '📂 <a href="%s">Open the download page</a>' % S["page"]]
     return "\n".join(lines)
 
 
@@ -337,38 +339,33 @@ def poll():
             time.sleep(3)
 
 
-# ---------------- upload ----------------
-def ensure_release(force=False):
-    if DRY or not shutil.which("gh") or not REPO:
-        return True
-    if not force and subprocess.run(["gh", "release", "view", TAG, "--repo", REPO], capture_output=True).returncode == 0:
-        return True
-    cmd = ["gh", "release", "create", TAG, "--repo", REPO, "--title", "Recording " + STAMP, "--notes", NAME]
-    if SHA:
-        cmd += ["--target", SHA]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 and "already exists" not in (r.stderr or ""):
-        S["rel_err"] = (r.stderr or r.stdout or "").strip()[:300]
-        print("gh release create failed:", S["rel_err"], flush=True)
-        return False
-    S["rel_err"] = ""
-    return True
-
-
-def gh_upload(path):
-    if DRY or not shutil.which("gh") or not REPO:
-        print("[dry] would upload", path, human(os.path.getsize(path)))
-        return True, ""
+# ---------------- upload (Gofile) ----------------
+def gofile_upload(path):
+    """Upload to Gofile (no account). All files of one recording go into the same folder page."""
+    if DRY:
+        print("[dry] would upload to gofile", path); return True, "https://gofile.io/d/DRYRUN", ""
     err = ""
-    for attempt in range(3):
-        ensure_release()
-        r = subprocess.run(["gh", "release", "upload", TAG, path, "--repo", REPO, "--clobber"], capture_output=True, text=True)
-        if r.returncode == 0:
-            return True, ""
-        err = (r.stderr or r.stdout or "").strip() or S["rel_err"]
-        print("gh release upload failed (try %d): %s" % (attempt + 1, err), flush=True)
-        time.sleep(5 * (attempt + 1))
-    return False, err
+    for attempt in range(6):
+        cmd = ["curl", "-sS", "-m", "3600", "-F", "file=@" + path]
+        if GF["folder"] and GF["token"]:
+            cmd += ["-F", "folderId=" + GF["folder"], "-F", "token=" + GF["token"]]
+        r = subprocess.run(cmd + [GOFILE_URL], capture_output=True, text=True)
+        try:
+            j = json.loads(r.stdout)
+        except Exception:
+            err = (r.stderr or r.stdout or "no answer from Gofile").strip()[:200]
+            j = None
+        if j is not None:
+            if j.get("status") == "ok":
+                d = j.get("data") or {}
+                GF["folder"] = d.get("parentFolder") or GF["folder"]
+                GF["token"] = d.get("guestToken") or GF["token"]
+                return True, d.get("downloadPage") or "", ""
+            err = json.dumps(j)[:200]
+            GF["folder"] = GF["token"] = ""          # maybe the folder/token was the problem, start a new folder
+        print("gofile upload failed (try %d): %s" % (attempt + 1, err), flush=True)
+        time.sleep(RETRY_BASE * (attempt + 1))
+    return False, "", err
 
 
 def media_info(path):
@@ -381,68 +378,28 @@ def media_info(path):
         return 0.0, 0, 0
 
 
-def tg_big(path, caption):
-    """Upload up to ~2 GB to your chat as the bot (MTProto). None = not configured, True = sent, False = failed."""
-    if not (API_ID and API_HASH and TOKEN and CHAT) or DRY:
-        return None
-    if os.path.getsize(path) > BIG_LIMIT:
-        print("File is larger than 1.95 GB, not sending to Telegram.", flush=True)
-        return False
-    try:
-        import asyncio
-        from pyrogram import Client
-    except Exception as e:
-        print("Telegram uploader missing:", e, flush=True)
-        return False
-    dur, w, h = media_info(path)
-    thumb = path + ".jpg"
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", path, "-frames:v", "1", "-vf", "scale=320:-2", thumb], capture_output=True)
-
-    async def go():
-        async with Client("rec", api_id=int(API_ID), api_hash=API_HASH, bot_token=TOKEN, in_memory=True, no_updates=True) as app:
-            if path.endswith(".mp4") and w:
-                kw = dict(caption=caption, supports_streaming=True, duration=int(dur), width=w, height=h)
-                if os.path.exists(thumb):
-                    kw["thumb"] = thumb
-                await app.send_video(int(CHAT), path, **kw)
-            else:
-                await app.send_document(int(CHAT), path, caption=caption)
-    ok = True
-    try:
-        asyncio.run(go())
-    except Exception as e:
-        print("Telegram upload failed:", repr(e), flush=True)
-        ok = False
-    try: os.remove(thumb)
-    except OSError: pass
-    return ok
-
-
 def process(ts):
     """remux the finished .ts to .mp4 (proper duration), upload it, tell Telegram, clean up."""
-    mp4 = ts[:-3] + ".mp4"
+    os.makedirs(MP4_DIR, exist_ok=True)
+    base = os.path.basename(ts)[:-3] + ".mp4"
+    mp4 = os.path.join(MP4_DIR, base)
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-movflags", "+faststart", mp4],
                        capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(mp4):
-        mp4 = ts
+        mp4 = ts; base = os.path.basename(ts)
+    elif not DRY:
+        try: os.remove(ts)                           # free disk space right away
+        except OSError: pass
     size = os.path.getsize(mp4)
     dur = media_info(mp4)[0]
     n = len(S["done"]) + 1
-    base = os.path.basename(mp4)
-    ok, err = gh_upload(mp4)
-    big = tg_big(mp4, "%s  ·  %s" % (base, mmss(dur))) if ok else None
+    ok, link, err = gofile_upload(mp4)
     head = "✅ <b>File %d saved</b>\n🎞 %s  ·  %s\n" % (n, mmss(dur), human(size))
     if ok:
+        if link:
+            S["page"] = link
         S["done"].append({"name": base, "size": size, "secs": dur})
-        if big:
-            say(head + "📨 Sent here as a video\n🔗 <a href=\"%s\">Backup copy</a>" % REL_URL)
-        elif big is False:
-            say(head + "⚠️ Could not send it to Telegram (see the run log)\n🔗 <a href=\"%s\">Download from GitHub</a>" % REL_URL)
-        else:
-            say(head + "🔗 <a href=\"%s\">Download from GitHub</a>" % REL_URL)
-        if big is None and size <= 49 * 1024 * 1024 and TOKEN and CHAT and not DRY:
-            subprocess.run(["curl", "-s", "-F", "chat_id=" + CHAT, "-F", "document=@" + mp4,
-                            "https://api.telegram.org/bot%s/sendDocument" % TOKEN], capture_output=True)
+        say(head + '⬇️ <a href="%s">Download page</a>  (all files of this recording are listed there)' % (link or S["page"]), buttons=True)
         if not DRY:
             for f in {ts, mp4}:
                 try: os.remove(f)
@@ -452,15 +409,11 @@ def process(ts):
         try: shutil.move(mp4, os.path.join(FAILED, base))
         except OSError: pass
         S["done"].append({"name": base, "size": size, "secs": dur})
-        say("⚠️ <b>Upload failed</b> for %s (%s)\n<b>Reason:</b> <code>%s</code>\n\nThe file is kept. Open the run page, scroll to <b>Artifacts</b> after the run ends and download it:\n%s\n\n"
-            "If the reason says <i>Resource not accessible by integration</i>: Settings > Actions > General > Workflow permissions > Read and write." %
-            (esc(base), human(size), esc((err or "unknown")[:250]), RUN_URL))
+        say("⚠️ <b>Upload to Gofile failed</b> for %s (%s)\n<b>Reason:</b> <code>%s</code>\n\nThe file is still on the GitHub server until the run ends. If this keeps happening, try again later." %
+            (esc(base), human(size), esc((err or "unknown")[:250])))
 
 
 def uploader():
-    ensure_release()
-    if S["rel_err"]:
-        say("⚠️ Could not create the GitHub release: <code>%s</code>" % esc(S["rel_err"]))
     while True:
         item = upq.get()
         if item is None:
@@ -536,7 +489,7 @@ def chain(rem_minutes):
         return
     say("⏳ The 6 hour job limit is near. Starting the next run to continue...")
     cmd = ["gh", "workflow", "run", "record.yml", "--repo", REPO, "-f", "url=" + URL, "-f", "minutes=%d" % rem_minutes,
-           "-f", "name=" + NAME, "-f", "part_min=%s" % PART_MIN]
+           "-f", "name=" + NAME, "-f", "part_min=%s" % PART_MIN, "-f", "part_mb=%d" % (PART_MAX / 1e6)]
     if REFERER:
         cmd += ["-f", "referer=" + REFERER]
     subprocess.run(cmd)
@@ -561,8 +514,9 @@ def record():
         say("❌ <b>The link could not be opened from GitHub's server</b>\n<b>Reason:</b> %s\n\n<code>%s</code>" % (esc(why), esc(err[-300:])))
         sys.exit(1)
     plan = ("stops after %d min" % MINUTES) if MINUTES else "runs until you press Stop"
-    say("🔴 <b>Recording started</b>\n🎬 %s\n⏱ %s\n✂️ New file every %g min (max %s)\n📍 GitHub server: %s\n🔗 <a href=\"%s\">Files will appear here</a>" %
-        (esc(NAME), plan, PART_MIN, human(PART_MAX), esc(where()), REL_URL), buttons=True)
+    every = "every %s%s" % (human(PART_MAX), (" or %g min" % PART_MIN) if PART_MIN > 0 else "")
+    say("🔴 <b>Recording started</b>\n🎬 %s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 GitHub server: %s\nThe first download link comes after the first file is full." %
+        (esc(NAME), plan, every, esc(where())), buttons=True)
     signal.signal(signal.SIGINT, lambda *a: halt())
     signal.signal(signal.SIGTERM, lambda *a: halt())
     total = MINUTES * 60
@@ -607,9 +561,12 @@ def record():
     upq.put(None)
     up.join()
     saved = sum(d["size"] for d in S["done"])
-    summary("## Recording finished\n%d file(s), %s. [Open the release](%s)" % (len(S["done"]), human(saved), REL_URL))
-    say("🏁 <b>Recording finished</b>\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n🔗 <a href=\"%s\">Download</a>" %
-        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), REL_URL))
+    page = S["page"]
+    summary("## Recording finished\n%d file(s), %s. %s" % (len(S["done"]), human(saved), ("[Download page](%s)" % page) if page else ""))
+    rows = "\n".join("%d.  %s  ·  %s" % (i + 1, human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30]))
+    say("🏁 <b>Recording finished</b>\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n\n%s%s" %
+        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), rows,
+         ('\n\n📂 <a href="%s">Download all files (one page)</a>' % page) if page else "\n\n⚠️ No file could be uploaded. See the run log."))
 
 
 def finish():
@@ -617,10 +574,9 @@ def finish():
     leftovers = sorted(glob.glob(os.path.join(OUT, "*.ts")))
     if not leftovers:
         return
-    ensure_release()
     for f in leftovers:
         process(f)
-    say("⚠️ <b>Recording was interrupted.</b> Saved %d leftover file(s).\n🔗 <a href=\"%s\">Download</a>" % (len(leftovers), REL_URL))
+    say("⚠️ <b>Recording was interrupted.</b> Saved %d leftover file(s).%s" % (len(leftovers), ('\n📂 <a href="%s">Download page</a>' % S["page"]) if S["page"] else ""))
 
 
 if __name__ == "__main__":
