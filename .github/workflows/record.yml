@@ -1,4 +1,4 @@
-name: Record
+name: Naim X Record
 on:
   workflow_dispatch:
     inputs:
@@ -7,13 +7,20 @@ on:
         required: true
       minutes:
         description: "Stop after N minutes (0 = until you send /stop)"
-        default: "480"
+        default: "120"
       name:
         description: "File name"
         default: "ClipByNaim"
       part_min:
-        description: "Minutes per file (20 is safe, GitHub allows 2 GB per file)"
+        description: "New file every N minutes (60 = auto-save every hour while recording continues)"
         default: "60"
+      part_mb:
+        description: "...or every N MB, whichever comes first (GitHub allows under 2000 MB per file)"
+        default: "1900"
+      referer:
+        description: "Optional: website the link is played on (only if the link needs it)"
+        required: false
+        default: ""
 
 permissions:
   contents: write     # upload recordings to a Release
@@ -29,10 +36,13 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
+      SHA: ${{ github.sha }}
       URL: ${{ inputs.url }}
       MINUTES: ${{ inputs.minutes }}
       NAME: ${{ inputs.name }}
       PART_MIN: ${{ inputs.part_min }}
+      PART_MB: ${{ inputs.part_mb }}
+      REFERER: ${{ inputs.referer }}
       TG_API_ID: ${{ secrets.TG_API_ID }}
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
     steps:
@@ -50,3 +60,11 @@ jobs:
       - name: Upload leftovers if cancelled
         if: always()
         run: python gh_record.py finish
+      - name: Keep files that failed to upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-uploads
+          path: rec_failed/
+          if-no-files-found: ignore
+          retention-days: 3
